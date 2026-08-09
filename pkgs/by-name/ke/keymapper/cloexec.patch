@@ -1,0 +1,113 @@
+From 07c3f12d7a2b19197d3bae0169081fdbdf428ea9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Annt=C3=B3in=20Wilkinson?= <anntoin@gmail.com>
+Date: Mon, 10 Aug 2026 00:16:33 +0100
+Subject: [PATCH] fix: prevent IPC socket fd leak into child processes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Use SOCK_CLOEXEC on all AF_UNIX sockets (listen, accept, connect) so
+that the @keymapperctl abstract socket fd is not inherited by child
+processes spawned via $(...) config commands (e.g. kitty, tofi).
+
+Previously, the inherited fd kept listening on the socket, preventing
+a restarted keymapper from rebinding it — resulting in 'Binding control
+port failed' errors and keybindings silently failing until the leaked
+processes were manually killed.
+
+In accept(), use accept4() with SOCK_CLOEXEC when available (detected
+via __GLIBC_PREREQ(2,10) for glibc; musl provides it without any
+feature-test macro) and fall back to accept() + fcntl(FD_CLOEXEC)
+otherwise, matching the existing platform split used for abstract
+socket addresses in this file.
+
+Assisted-by: Hermes:glm-5.2 [gh]
+---
+ CHANGELOG.md        |  6 ++++++
+ src/common/Host.cpp | 22 +++++++++++++++++++---
+ 2 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 858bd1f..c5c1b47 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,12 @@
+ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ 
++## [Unreleased]
++
++### Fixed
++
++- Prevent IPC socket fd leak into child processes spawned by `$(...)` config commands, which caused `Binding control port failed` errors after restart ([#388](https://github.com/houmain/keymapper/pull/388)).
++
+ ## [Version 5.6.0] - 2026-06-14
+ 
+ ### Added
+diff --git a/src/common/Host.cpp b/src/common/Host.cpp
+index 87ef0a8..78e6970 100644
+--- a/src/common/Host.cpp
++++ b/src/common/Host.cpp
+@@ -66,6 +66,15 @@ void make_non_blocking(Socket socket_fd) {
+ 
+ #else // !defined(_WIN32)
+ 
++#include <features.h>
++// accept4() requires _GNU_SOURCE on glibc >= 2.10.
++// On musl it is available without any feature-test macro.
++#if defined(__GLIBC__) && __GLIBC_PREREQ(2, 10)
++  #define HAVE_ACCEPT4 1
++  #ifndef _GNU_SOURCE
++  #define _GNU_SOURCE
++  #endif
++#endif
+ #include <csignal>
+ #include <unistd.h>
+ #include <fcntl.h>
+@@ -120,7 +129,7 @@ Host::~Host() {
+ }
+ 
+ bool Host::listen() {
+-  m_listen_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
++  m_listen_fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+   if (m_listen_fd == invalid_socket)
+     return false;
+ 
+@@ -158,9 +167,16 @@ Connection Host::accept(std::optional<Duration> timeout) {
+   if (!block_until_readable(m_listen_fd, timeout))
+     return { };
+ 
++# if defined(HAVE_ACCEPT4)
++  auto socket_fd = ::accept4(m_listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
++# else
+   auto socket_fd = ::accept(m_listen_fd, nullptr, nullptr);
++# endif
+   if (socket_fd == invalid_socket)
+     return { };
++# if !defined(HAVE_ACCEPT4)
++  ::fcntl(socket_fd, F_SETFD, ::fcntl(socket_fd, F_GETFD) | FD_CLOEXEC);
++# endif
+   make_blocking(socket_fd);
+   auto connection = Connection(socket_fd);
+ 
+@@ -190,7 +206,7 @@ Connection Host::connect(std::optional<Duration> timeout) {
+   const auto retry_until_timepoint = (timeout ?
+     std::make_optional(Clock::now() + *timeout) : std::nullopt);
+ 
+-  auto socket_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
++  auto socket_fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+   for (;;) {
+     if (socket_fd == invalid_socket)
+       return { };
+@@ -205,7 +221,7 @@ Connection Host::connect(std::optional<Duration> timeout) {
+           !connection.read(&versions_match)) {
+         // this fails regularly when reconnecting to a closing host
+         connection.disconnect();
+-        socket_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
++        socket_fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+         continue;
+       }
+       if (!versions_match)
+-- 
+2.55.0
+

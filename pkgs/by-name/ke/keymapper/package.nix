@@ -26,6 +26,10 @@ stdenv.mkDerivation (finalAttrs: {
     hash = "sha256-0GadjBGgawn0V+PV04R6ULmanNUF7R14N/jHhObcTzM=";
   };
 
+  # Prevent IPC socket (@keymapperctl) fd leak into child processes.
+  # Remove after upstream PR #388 is merged and a new release is cut.
+  patches = [ ./cloexec.patch ];
+
   # all the following must be in nativeBuildInputs
   nativeBuildInputs = [
     cmake
